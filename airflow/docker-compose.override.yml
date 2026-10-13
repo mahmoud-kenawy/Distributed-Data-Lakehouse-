@@ -1,0 +1,112 @@
+x-minio-common: &minio-common
+  image: cgr.dev/chainguard/minio:latest
+  user: "0:0"
+  command: ["server", "--console-address", ":9001", "http://minio{1...2}/data{1...2}"]
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin12345}
+  restart: unless-stopped
+
+services:
+  minio1:
+    <<: *minio-common
+    hostname: minio1
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio1-data1:/data1
+      - minio1-data2:/data2
+
+  minio2:
+    <<: *minio-common
+    hostname: minio2
+    volumes:
+      - minio2-data1:/data1
+      - minio2-data2:/data2
+
+  minio-init:
+    image: amazon/aws-cli:latest
+    depends_on: [minio1, minio2]
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-admin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-admin12345}
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until aws --endpoint-url http://minio1:9000 s3api head-bucket --bucket warehouse 2>/dev/null
+        || aws --endpoint-url http://minio1:9000 s3api create-bucket --bucket warehouse;
+        do echo "waiting for minio..."; sleep 3; done; echo "bucket ready"
+
+  nessie-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nessie
+      POSTGRES_USER: nessie
+      POSTGRES_PASSWORD: nessie
+    volumes:
+      - nessie-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nessie -d nessie"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:${NESSIE_VERSION:-0.108.8}
+    restart: unless-stopped
+    depends_on:
+      nessie-db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "19120:19120"
+    environment:
+      # JDBC version store
+      - nessie.version.store.type=JDBC
+      - nessie.version.store.persist.jdbc.datasource=postgresql
+      - quarkus.datasource.postgresql.jdbc.url=jdbc:postgresql://nessie-db:5432/nessie
+      - quarkus.datasource.postgresql.username=nessie
+      - quarkus.datasource.postgresql.password=nessie
+      # Warehouse / S3 catalog settings (official format from projectnessie docs)
+      - nessie.catalog.default-warehouse=warehouse
+      - nessie.catalog.warehouses.warehouse.location=s3://warehouse/
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.endpoint=http://minio1:9000/
+      - nessie.catalog.service.s3.default-options.auth-type=STATIC
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      # The actual MinIO credentials resolved via the secret alias above
+      - nessie.catalog.secrets.access-key.name=${MINIO_ROOT_USER:-admin}
+      - nessie.catalog.secrets.access-key.secret=${MINIO_ROOT_PASSWORD:-admin12345}
+
+  # Dremio - replaces Trino as the query engine
+  # UI:        http://localhost:9047
+  # JDBC/ODBC: localhost:31010
+  # Arrow Flight: localhost:32010
+  dremio:
+    image: dremio/dremio-oss:latest
+    platform: linux/x86_64
+    container_name: dremio
+    restart: unless-stopped
+    depends_on: [nessie]
+    ports:
+      - "9047:9047"    # Web UI
+      - "31010:31010"  # JDBC / ODBC client connections
+      - "32010:32010"  # Arrow Flight
+    environment:
+      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
+    volumes:
+      - dremio-data:/opt/dremio/data
+
+volumes:
+  minio1-data1:
+  minio1-data2:
+  minio2-data1:
+  minio2-data2:
+  nessie-db-data:
+  dremio-data:
